@@ -17,12 +17,18 @@
 #[cfg_attr(adc_c0, path = "c0.rs")]
 mod _version;
 
-use core::marker::PhantomData;
+use core::{
+    future::{poll_fn, Future, IntoFuture},
+    marker::PhantomData,
+    pin::Pin,
+    task::Poll,
+    usize,
+};
 
 #[allow(unused)]
 #[cfg(not(any(adc_f3v3, adc_wba)))]
 pub use _version::*;
-use embassy_hal_internal::{impl_peripheral, PeripheralType};
+use embassy_hal_internal::{impl_peripheral, Peri, PeripheralType};
 #[cfg(any(adc_f1, adc_f3v1, adc_v1, adc_l0, adc_f3v2))]
 use embassy_sync::waitqueue::AtomicWaker;
 
@@ -34,7 +40,10 @@ pub use crate::pac::adc::vals;
 #[cfg(not(any(adc_f1, adc_f3v3)))]
 pub use crate::pac::adc::vals::Res as Resolution;
 pub use crate::pac::adc::vals::SampleTime;
-use crate::peripherals;
+use crate::{
+    dma::{AnyChannel, ChannelState, DmaCtrlImpl, Priority, Request, Transfer, TransferOptions},
+    peripherals,
+};
 
 #[cfg(not(adc_wba))]
 dma_trait!(RxDma, Instance);
@@ -43,12 +52,104 @@ dma_trait!(RxDma4, adc4::Instance);
 #[cfg(adc_wba)]
 dma_trait!(RxDma4, adc4::Instance);
 
+pub struct Buffer<'a, const N: usize> {
+    buffer: [u16; N],
+    transfer: Transfer<'a>,
+    // transfer: Pin<Transfer<'a>>,
+}
+
+pub struct NoBuffer;
+
+pub trait Buffered {
+    const FOO: usize;
+}
+impl<'a, const N: usize> Buffered for Buffer<'a, N> {
+    const FOO: usize = N;
+}
+impl Buffered for NoBuffer {
+    const FOO: usize = 0;
+}
+
 /// Analog to Digital driver.
-pub struct Adc<'d, T: Instance> {
+pub struct Adc<'d, T: Instance, B: Buffered = NoBuffer> {
     #[allow(unused)]
     adc: crate::Peri<'d, T>,
     #[cfg(not(any(adc_f3v3, adc_f3v2, adc_wba)))]
     sample_time: SampleTime,
+    buffer: B,
+}
+
+// struct Foo<'a>([u8; 1], &'a mut [u8]);
+// fn foo<'a>() -> Foo<'a> {
+//     let mut x = [0];
+//     Foo(x, &mut x)
+// }
+
+impl<'d, T: Instance> Adc<'d, T> {
+    pub async fn into_buffered<'a, const N: usize>(
+        self,
+        dma: Peri<'a, impl RxDma<T>>,
+        dma_prio: Priority,
+    ) -> Adc<'d, T, Buffer<'a, N>> {
+        let mut buffer = [0; N];
+        let options = TransferOptions {
+            circular: true,
+            half_transfer_ir: true,
+            complete_transfer_ir: true,
+            priority: dma_prio,
+        };
+        let request = dma.request();
+        let transfer: Transfer<'a> =
+            unsafe { Transfer::new_read_raw(dma, request, T::regs().dr().as_ptr() as *mut u16, &mut buffer, options) };
+        // let x: dyn Future<Output=()>=  transfer.into();
+        // let x = transfer.into_future();
+        // x.po
+        // transfer.await;
+        Adc {
+            adc: self.adc,
+            sample_time: self.sample_time,
+            buffer: Buffer {
+                buffer,
+                transfer: transfer.into(),
+                // transfer: Pin::<_> { transfer },
+            },
+        }
+    }
+}
+
+impl<'d, 'a, T: Instance, const N: usize> Adc<'d, T, Buffer<'a, N>> {
+    // pub async fn read<'b: 'd + 'a>(&self) -> &'b [u16] {
+    //     // let foo = Pin<&mut Self>{&mut self};
+    //     poll_fn(|cx| {
+    //         let state: &ChannelState = &STATE[self.channel.id as usize];
+
+    //         state.waker.register(cx.waker());
+    //         Poll::Ready(&self.buffer.buffer[..N / 2])
+    //     })
+    //     .await
+    // }
+    pub async fn read_exact(&mut self, buffer: &mut [W]) -> Result<usize, Error> {
+        let mut read_data = 0;
+        let buffer_len = buffer.len();
+        let dma = &mut DmaCtrlImpl(self.channel.reborrow())
+
+        poll_fn(|cx| {
+            dma.set_waker(cx.waker());
+
+            match self.read(dma, &mut buffer[read_data..buffer_len]) {
+                Ok((len, remaining)) => {
+                    read_data += len;
+                    if read_data == buffer_len {
+                        Poll::Ready(Ok(remaining))
+                    } else {
+                        Poll::Pending
+                    }
+                }
+                Err(e) => Poll::Ready(Err(e)),
+            }
+        })
+        .await
+    }
 }
 
 #[cfg(any(adc_f1, adc_f3v1, adc_v1, adc_l0, adc_f3v2))]

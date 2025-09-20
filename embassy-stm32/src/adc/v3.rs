@@ -12,8 +12,13 @@ pub use pac::adc::vals::{Ovsr, Ovss, Presc};
 use super::{
     blocking_delay_us, Adc, AdcChannel, AnyAdcChannel, Instance, Resolution, RxDma, SampleTime, SealedAdcChannel,
 };
-use crate::dma::Transfer;
+use crate::{adc::NoBuffer, dma::Transfer};
 use crate::{pac, rcc, Peri};
+
+#[cfg(adc_g0)]
+mod ringbuffered_v3;
+// #[cfg(adc_g0)]
+// pub use ringbuffered_v3::{RingBufferedAdc, Sequence};
 
 /// Default VREF voltage used for sample conversion to millivolts.
 pub const VREF_DEFAULT_MV: u32 = 3300;
@@ -179,9 +184,11 @@ impl<'d, T: Instance> Adc<'d, T> {
     pub fn new(adc: Peri<'d, T>) -> Self {
         Self::init_regulator();
         Self::init_calibrate();
+        // let x: Adc<'d, T, NoBuffer> = Adc<'d, T, NoBuffer>{};
         Self {
             adc,
             sample_time: SampleTime::from_bits(0),
+            buffer: NoBuffer,
         }
     }
 
@@ -221,6 +228,7 @@ impl<'d, T: Instance> Adc<'d, T> {
         Self {
             adc,
             sample_time: SampleTime::from_bits(0),
+            buffer: NoBuffer,
         }
     }
 

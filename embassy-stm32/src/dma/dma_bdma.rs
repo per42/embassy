@@ -760,6 +760,8 @@ impl<'a> Transfer<'a> {
 
         core::mem::forget(self);
     }
+
+    pub async fn wait() {}
 }
 
 impl<'a> Drop for Transfer<'a> {
@@ -790,7 +792,7 @@ impl<'a> Future for Transfer<'a> {
 
 // ==============================
 
-struct DmaCtrlImpl<'a>(Peri<'a, AnyChannel>);
+pub struct DmaCtrlImpl<'a>(Peri<'a, AnyChannel>);
 
 impl<'a> DmaCtrl for DmaCtrlImpl<'a> {
     fn get_remaining_transfers(&self) -> usize {
