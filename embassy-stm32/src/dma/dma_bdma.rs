@@ -5,6 +5,7 @@ use core::task::{Context, Poll, Waker};
 
 use embassy_hal_internal::Peri;
 use embassy_sync::waitqueue::AtomicWaker;
+use futures_util::Stream;
 
 use super::ringbuffer::{DmaCtrl, Error, ReadableDmaRingBuffer, WritableDmaRingBuffer};
 use super::word::{Word, WordSize};
@@ -242,12 +243,14 @@ mod bdma_only {
 
 pub(crate) struct ChannelState {
     waker: AtomicWaker,
+    half_count: AtomicUsize,
     complete_count: AtomicUsize,
 }
 
 impl ChannelState {
     pub(crate) const NEW: Self = Self {
         waker: AtomicWaker::new(),
+        half_count: AtomicUsize::new(0),
         complete_count: AtomicUsize::new(0),
     };
 }
@@ -313,6 +316,13 @@ impl AnyChannel {
                 if isr.htif(info.num) && cr.read().htie() {
                     // Acknowledge half transfer complete interrupt
                     r.ifcr().write(|w| w.set_htif(info.num, true));
+                    #[cfg(not(armv6m))]
+                    state.half_count.fetch_add(1, Ordering::Release);
+                    #[cfg(armv6m)]
+                    critical_section::with(|_| {
+                        let x = state.half_count.load(Ordering::Relaxed);
+                        state.half_count.store(x + 1, Ordering::Release);
+                    })
                 } else if isr.tcif(info.num) && cr.read().tcie() {
                     // Acknowledge transfer complete interrupt
                     r.ifcr().write(|w| w.set_tcif(info.num, true));
@@ -599,6 +609,11 @@ impl AnyChannel {
     }
 }
 
+pub enum TransferEvent {
+    Half,
+    Complete,
+}
+
 /// DMA transfer.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Transfer<'a> {
@@ -761,7 +776,37 @@ impl<'a> Transfer<'a> {
         core::mem::forget(self);
     }
 
-    pub async fn wait() {}
+    // pub async fn half_complete_interrupt(&mut self) {
+    //     // let dma = &mut DmaCtrlImpl(self.channel.reborrow());
+    //     let mut first_poll = true;
+
+    //     poll_fn(|cx| {
+    //         let state: &ChannelState = &STATE[self.channel.id as usize];
+    //         state.waker.register(cx.waker());
+    //         // STATE[self.channel.id as usize].waker.register(cx.waker());
+    //         // dma.set_waker(cx.waker());
+    //         let (half, comp) = (
+    //             state.half_count.load(Ordering::Acquire),
+    //             state.complete_count.load(Ordering::Acquire),
+    //         );
+
+    //         if first_poll {
+    //             first_poll = false;
+    //             Poll::Pending
+    //         } else {
+    //             Poll::Ready(())
+    //         }
+    //     })
+    //     .await
+    // }
+
+    pub fn completions(&self) -> impl Stream<Item = TransferEvent> + '_ {
+        TransferStream {
+            transfer: self,
+            prev_half_count: 0,
+            prev_complete_count: 0,
+        }
+    }
 }
 
 impl<'a> Drop for Transfer<'a> {
@@ -787,6 +832,63 @@ impl<'a> Future for Transfer<'a> {
         } else {
             Poll::Ready(())
         }
+    }
+}
+
+// impl<'a> Stream for Transfer<'a> {
+//     type Item = TransferEvent;
+
+//     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+//         let state: &ChannelState = &STATE[self.channel.id as usize];
+
+//         state.waker.register(cx.waker());
+
+//         let (half, comp) = (
+//             state.half_count.load(Ordering::Acquire),
+//             state.complete_count.load(Ordering::Acquire),
+//         );
+
+//         if self.is_running() {
+//             Poll::Pending
+//         } else {
+//             Poll::Ready(())
+//         }
+//     }
+// }
+
+pub struct TransferStream<'a> {
+    transfer: &'a Transfer<'a>,
+    prev_half_count: usize,
+    prev_complete_count: usize,
+}
+
+impl<'a> Stream for TransferStream<'a> {
+    type Item = TransferEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let state: &ChannelState = &STATE[self.transfer.channel.id as usize];
+
+        state.waker.register(cx.waker());
+
+        let (half_count, complete_count) = (
+            state.half_count.load(Ordering::Acquire),
+            state.complete_count.load(Ordering::Acquire),
+        );
+
+        let poll = match (
+            half_count - self.prev_half_count,
+            complete_count - self.prev_complete_count,
+        ) {
+            (0, 0) => Poll::Pending,
+            (1, 0) => Poll::Ready(Some(TransferEvent::Half)),
+            (0, 1) => Poll::Ready(Some(TransferEvent::Complete)),
+            _ => Poll::Ready(None), // Missed completion events,
+        };
+
+        self.prev_half_count = half_count;
+        self.prev_complete_count = complete_count;
+
+        poll
     }
 }
 

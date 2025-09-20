@@ -31,6 +31,7 @@ pub use _version::*;
 use embassy_hal_internal::{impl_peripheral, Peri, PeripheralType};
 #[cfg(any(adc_f1, adc_f3v1, adc_v1, adc_l0, adc_f3v2))]
 use embassy_sync::waitqueue::AtomicWaker;
+use futures_util::{Stream, StreamExt};
 
 #[cfg(any(adc_u5, adc_wba))]
 #[path = "adc4.rs"]
@@ -41,7 +42,7 @@ pub use crate::pac::adc::vals;
 pub use crate::pac::adc::vals::Res as Resolution;
 pub use crate::pac::adc::vals::SampleTime;
 use crate::{
-    dma::{AnyChannel, ChannelState, DmaCtrlImpl, Priority, Request, Transfer, TransferOptions},
+    dma::{AnyChannel, ChannelState, DmaCtrlImpl, Priority, Request, Transfer, TransferEvent, TransferOptions},
     peripherals,
 };
 
@@ -86,12 +87,12 @@ pub struct Adc<'d, T: Instance, B: Buffered = NoBuffer> {
 // }
 
 impl<'d, T: Instance> Adc<'d, T> {
-    pub async fn into_buffered<'a, const N: usize>(
+    pub fn into_buffered<'a, const N: usize>(
         self,
         dma: Peri<'a, impl RxDma<T>>,
         dma_prio: Priority,
+        mut buffer: [u16; N],
     ) -> Adc<'d, T, Buffer<'a, N>> {
-        let mut buffer = [0; N];
         let options = TransferOptions {
             circular: true,
             half_transfer_ir: true,
@@ -118,6 +119,13 @@ impl<'d, T: Instance> Adc<'d, T> {
 }
 
 impl<'d, 'a, T: Instance, const N: usize> Adc<'d, T, Buffer<'a, N>> {
+    pub fn read(&self) -> impl Stream<Item = &[u16]> {
+        self.buffer.transfer.completions().map(|ev| match ev {
+            TransferEvent::Half => &self.buffer.buffer[..N / 2],
+            TransferEvent::Complete => &self.buffer.buffer[N / 2..],
+        })
+    }
+
     // pub async fn read<'b: 'd + 'a>(&self) -> &'b [u16] {
     //     // let foo = Pin<&mut Self>{&mut self};
     //     poll_fn(|cx| {
@@ -128,28 +136,28 @@ impl<'d, 'a, T: Instance, const N: usize> Adc<'d, T, Buffer<'a, N>> {
     //     })
     //     .await
     // }
-    pub async fn read_exact(&mut self, buffer: &mut [W]) -> Result<usize, Error> {
-        let mut read_data = 0;
-        let buffer_len = buffer.len();
-        let dma = &mut DmaCtrlImpl(self.channel.reborrow())
+    // pub async fn read_exact(&mut self, buffer: &mut [W]) -> Result<usize, Error> {
+    //     let mut read_data = 0;
+    //     let buffer_len = buffer.len();
+    //     let dma = &mut DmaCtrlImpl(self.channel.reborrow())
 
-        poll_fn(|cx| {
-            dma.set_waker(cx.waker());
+    //     poll_fn(|cx| {
+    //         dma.set_waker(cx.waker());
 
-            match self.read(dma, &mut buffer[read_data..buffer_len]) {
-                Ok((len, remaining)) => {
-                    read_data += len;
-                    if read_data == buffer_len {
-                        Poll::Ready(Ok(remaining))
-                    } else {
-                        Poll::Pending
-                    }
-                }
-                Err(e) => Poll::Ready(Err(e)),
-            }
-        })
-        .await
-    }
+    //         match self.read(dma, &mut buffer[read_data..buffer_len]) {
+    //             Ok((len, remaining)) => {
+    //                 read_data += len;
+    //                 if read_data == buffer_len {
+    //                     Poll::Ready(Ok(remaining))
+    //                 } else {
+    //                     Poll::Pending
+    //                 }
+    //             }
+    //             Err(e) => Poll::Ready(Err(e)),
+    //         }
+    //     })
+    //     .await
+    // }
 }
 
 #[cfg(any(adc_f1, adc_f3v1, adc_v1, adc_l0, adc_f3v2))]
