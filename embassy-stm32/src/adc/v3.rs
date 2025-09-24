@@ -1,17 +1,20 @@
 use cfg_if::cfg_if;
 #[cfg(adc_g0)]
 use heapless::Vec;
-use pac::adc::vals::Dmacfg;
+pub use pac::adc::vals::Dmacfg;
 #[cfg(adc_g0)]
 use pac::adc::vals::{Ckmode, Smpsel};
 #[cfg(adc_v3)]
 use pac::adc::vals::{OversamplingRatio, OversamplingShift, Rovsm, Trovs};
 #[cfg(adc_g0)]
 pub use pac::adc::vals::{Ovsr, Ovss, Presc};
+use stm32_metapac::adc::vals::{Exten, Extsel};
 
 use super::{
     blocking_delay_us, Adc, AdcChannel, AnyAdcChannel, Instance, Resolution, RxDma, SampleTime, SealedAdcChannel,
 };
+#[cfg(adc_g0)]
+use crate::adc::Buffered;
 use crate::{adc::NoBuffer, dma::Transfer};
 use crate::{pac, rcc, Peri};
 
@@ -146,6 +149,189 @@ pub enum Clock {
 
 }}
 
+// TODO: Segregate to ADC enabled and disabled structs
+//
+// The software must write the ADCAL and ADEN bits in the ADC_CR register and configure
+// the ADC_CFGR1 and ADC_CFGR2 registers only when the ADC is disabled (ADEN must
+// be cleared).
+// The software must only write to the ADSTART and ADDIS bits in the ADC_CR register only
+// if the ADC is enabled and there is no pending request to disable the ADC (ADEN = 1 and
+// ADDIS = 0).
+
+impl<'d, T, B> Adc<'d, T, B>
+where
+    T: Instance,
+    B: Buffered,
+{
+    pub fn prepare_dma(&mut self, cfg: Dmacfg) {
+        // Clear overrun flag before starting transfer.
+        T::regs().isr().modify(|reg| {
+            reg.set_ovr(true);
+        });
+
+        #[cfg(not(any(adc_g0, adc_u0)))]
+        let cfgr1 = T::regs().cfgr();
+        #[cfg(any(adc_g0, adc_u0))]
+        let cfgr1 = T::regs().cfgr1();
+        cfgr1.modify(|reg| {
+            reg.set_discen(false);
+            reg.set_cont(false);
+            reg.set_dmacfg(cfg);
+            reg.set_dmaen(true);
+        });
+    }
+
+    pub fn set_trigger(&mut self, source: Option<Extsel>) {
+        T::regs().cfgr1().modify(|reg| {
+            if let Some(extsel) = source {
+                reg.set_extsel(extsel);
+                reg.set_exten(Exten::RISING_EDGE);
+            } else {
+                reg.set_exten(Exten::DISABLED);
+            }
+        });
+    }
+
+    // Enable ADC only when it is not already running.
+    pub fn enable(&mut self) {
+        // Make sure bits are off
+        while T::regs().cr().read().addis() {
+            // spin
+        }
+
+        if !T::regs().cr().read().aden() {
+            // Enable ADC
+            T::regs().isr().modify(|reg| {
+                reg.set_adrdy(true);
+            });
+            T::regs().cr().modify(|reg| {
+                reg.set_aden(true);
+            });
+
+            while !T::regs().isr().read().adrdy() {
+                // spin
+            }
+        }
+    }
+
+    pub fn start_conversion(&mut self) {
+        T::regs().cr().modify(|reg| {
+            reg.set_adstart(true);
+        });
+    }
+}
+
+#[cfg(adc_g0)]
+impl<'d, T, B> Adc<'d, T, B>
+where
+    T: Instance,
+    B: Buffered,
+{
+    pub fn configure_channels<'a>(
+        &self,
+        sequence: impl ExactSizeIterator<Item = (&'a mut AnyAdcChannel<T>, SampleTime)>,
+    ) {
+        let mut sample_times = Vec::<SampleTime, SAMPLE_TIMES_CAPACITY>::new();
+
+        T::regs().chselr().write(|chselr| {
+            T::regs().smpr().write(|smpr| {
+                for (channel, sample_time) in sequence {
+                    chselr.set_chsel(channel.channel.into(), true);
+                    if let Some(i) = sample_times.iter().position(|&t| t == sample_time) {
+                        smpr.set_smpsel(channel.channel.into(), (i as u8).into());
+                    } else {
+                        smpr.set_sample_time(sample_times.len(), sample_time);
+                        if let Err(_) = sample_times.push(sample_time) {
+                            panic!(
+                                "Implementation is limited to {} unique sample times among all channels.",
+                                SAMPLE_TIMES_CAPACITY
+                            );
+                        }
+                    }
+                }
+            })
+        });
+    }
+}
+
+#[cfg(not(adc_g0))]
+impl<'d, T, B> Adc<'d, T, B>
+where
+    T: Instance,
+    B: Buffered,
+{
+    pub fn configure_channels<'a>(
+        &self,
+        sequence: impl ExactSizeIterator<Item = (&'a mut AnyAdcChannel<T>, SampleTime)>,
+    ) {
+        // Set sequence length
+        #[cfg(not(any(adc_g0, adc_u0)))]
+        T::regs().sqr1().modify(|w| {
+            w.set_l(sequence.len() as u8 - 1);
+        });
+
+        #[cfg(adc_u0)]
+        let mut channel_mask = 0;
+
+        // Configure channels and ranks
+        for (_i, (channel, sample_time)) in sequence.enumerate() {
+            Self::configure_channel(channel, sample_time);
+
+            // Each channel is sampled according to sequence
+            #[cfg(not(any(adc_g0, adc_u0)))]
+            match _i {
+                0..=3 => {
+                    T::regs().sqr1().modify(|w| {
+                        w.set_sq(_i, channel.channel());
+                    });
+                }
+                4..=8 => {
+                    T::regs().sqr2().modify(|w| {
+                        w.set_sq(_i - 4, channel.channel());
+                    });
+                }
+                9..=13 => {
+                    T::regs().sqr3().modify(|w| {
+                        w.set_sq(_i - 9, channel.channel());
+                    });
+                }
+                14..=15 => {
+                    T::regs().sqr4().modify(|w| {
+                        w.set_sq(_i - 14, channel.channel());
+                    });
+                }
+                _ => unreachable!(),
+            }
+
+            #[cfg(adc_u0)]
+            {
+                channel_mask |= 1 << channel.channel();
+            }
+        }
+
+        // On G0 and U0 enabled channels are sampled from 0 to last channel.
+        // It is possible to add up to 8 sequences if CHSELRMOD = 1.
+        // However for supporting more than 8 channels alternative CHSELRMOD = 0 approach is used.
+        #[cfg(adc_u0)]
+        T::regs().chselr().modify(|reg| {
+            reg.set_chsel(channel_mask);
+        });
+    }
+
+    #[cfg(not(adc_g0))]
+    fn configure_channel(channel: &mut impl AdcChannel<T>, sample_time: SampleTime) {
+        // RM0492, RM0481, etc.
+        // "This option bit must be set to 1 when ADCx_INP0 or ADCx_INN1 channel is selected."
+        #[cfg(any(adc_h5, adc_h7rs))]
+        if channel.channel() == 0 {
+            T::regs().or().modify(|reg| reg.set_op0(true));
+        }
+
+        // Configure channel
+        Self::set_channel_sample_time(channel.channel(), sample_time);
+    }
+}
+
 impl<'d, T: Instance> Adc<'d, T> {
     /// Enable the voltage regulator
     fn init_regulator() {
@@ -229,28 +415,6 @@ impl<'d, T: Instance> Adc<'d, T> {
             adc,
             sample_time: SampleTime::from_bits(0),
             buffer: NoBuffer,
-        }
-    }
-
-    // Enable ADC only when it is not already running.
-    fn enable(&mut self) {
-        // Make sure bits are off
-        while T::regs().cr().read().addis() {
-            // spin
-        }
-
-        if !T::regs().cr().read().aden() {
-            // Enable ADC
-            T::regs().isr().modify(|reg| {
-                reg.set_adrdy(true);
-            });
-            T::regs().cr().modify(|reg| {
-                reg.set_aden(true);
-            });
-
-            while !T::regs().isr().read().adrdy() {
-                // spin
-            }
         }
     }
 
@@ -435,33 +599,9 @@ impl<'d, T: Instance> Adc<'d, T> {
         Self::cancel_conversions();
         self.enable();
 
-        // Set sequence length
-        #[cfg(not(any(adc_g0, adc_u0)))]
-        T::regs().sqr1().modify(|w| {
-            w.set_l(sequence.len() as u8 - 1);
-        });
-
         self.configure_channels(sequence);
-        // Set continuous mode with oneshot dma.
-        // Clear overrun flag before starting transfer.
-        T::regs().isr().modify(|reg| {
-            reg.set_ovr(true);
-        });
 
-        #[cfg(not(any(adc_g0, adc_u0)))]
-        T::regs().cfgr().modify(|reg| {
-            reg.set_discen(false);
-            reg.set_cont(true);
-            reg.set_dmacfg(Dmacfg::ONE_SHOT);
-            reg.set_dmaen(true);
-        });
-        #[cfg(any(adc_g0, adc_u0))]
-        T::regs().cfgr1().modify(|reg| {
-            reg.set_discen(false);
-            reg.set_cont(true);
-            reg.set_dmacfg(Dmacfg::ONE_SHOT);
-            reg.set_dmaen(true);
-        });
+        self.prepare_dma(Dmacfg::ONE_SHOT);
 
         let request = rx_dma.request();
         let transfer = unsafe {
@@ -494,99 +634,6 @@ impl<'d, T: Instance> Adc<'d, T> {
         T::regs().cfgr1().modify(|reg| {
             reg.set_cont(false);
         });
-    }
-
-    #[cfg(adc_g0)]
-    pub fn configure_channels<'a>(
-        &self,
-        sequence: impl ExactSizeIterator<Item = (&'a mut AnyAdcChannel<T>, SampleTime)>,
-    ) {
-        let mut sample_times = Vec::<SampleTime, SAMPLE_TIMES_CAPACITY>::new();
-
-        T::regs().chselr().write(|chselr| {
-            T::regs().smpr().write(|smpr| {
-                for (channel, sample_time) in sequence {
-                    chselr.set_chsel(channel.channel.into(), true);
-                    if let Some(i) = sample_times.iter().position(|&t| t == sample_time) {
-                        smpr.set_smpsel(channel.channel.into(), (i as u8).into());
-                    } else {
-                        smpr.set_sample_time(sample_times.len(), sample_time);
-                        if let Err(_) = sample_times.push(sample_time) {
-                            panic!(
-                                "Implementation is limited to {} unique sample times among all channels.",
-                                SAMPLE_TIMES_CAPACITY
-                            );
-                        }
-                    }
-                }
-            })
-        });
-    }
-
-    #[cfg(not(adc_g0))]
-    pub fn configure_channels<'a>(
-        &self,
-        sequence: impl ExactSizeIterator<Item = (&'a mut AnyAdcChannel<T>, SampleTime)>,
-    ) {
-        #[cfg(adc_u0)]
-        let mut channel_mask = 0;
-
-        // Configure channels and ranks
-        for (_i, (channel, sample_time)) in sequence.enumerate() {
-            Self::configure_channel(channel, sample_time);
-
-            // Each channel is sampled according to sequence
-            #[cfg(not(any(adc_g0, adc_u0)))]
-            match _i {
-                0..=3 => {
-                    T::regs().sqr1().modify(|w| {
-                        w.set_sq(_i, channel.channel());
-                    });
-                }
-                4..=8 => {
-                    T::regs().sqr2().modify(|w| {
-                        w.set_sq(_i - 4, channel.channel());
-                    });
-                }
-                9..=13 => {
-                    T::regs().sqr3().modify(|w| {
-                        w.set_sq(_i - 9, channel.channel());
-                    });
-                }
-                14..=15 => {
-                    T::regs().sqr4().modify(|w| {
-                        w.set_sq(_i - 14, channel.channel());
-                    });
-                }
-                _ => unreachable!(),
-            }
-
-            #[cfg(adc_u0)]
-            {
-                channel_mask |= 1 << channel.channel();
-            }
-        }
-
-        // On G0 and U0 enabled channels are sampled from 0 to last channel.
-        // It is possible to add up to 8 sequences if CHSELRMOD = 1.
-        // However for supporting more than 8 channels alternative CHSELRMOD = 0 approach is used.
-        #[cfg(adc_u0)]
-        T::regs().chselr().modify(|reg| {
-            reg.set_chsel(channel_mask);
-        });
-    }
-
-    #[cfg(not(adc_g0))]
-    fn configure_channel(channel: &mut impl AdcChannel<T>, sample_time: SampleTime) {
-        // RM0492, RM0481, etc.
-        // "This option bit must be set to 1 when ADCx_INP0 or ADCx_INN1 channel is selected."
-        #[cfg(any(adc_h5, adc_h7rs))]
-        if channel.channel() == 0 {
-            T::regs().or().modify(|reg| reg.set_op0(true));
-        }
-
-        // Configure channel
-        Self::set_channel_sample_time(channel.channel(), sample_time);
     }
 
     fn read_channel(&mut self, channel: &mut impl AdcChannel<T>) -> u16 {

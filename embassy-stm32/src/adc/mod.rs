@@ -31,7 +31,8 @@ pub use _version::*;
 use embassy_hal_internal::{impl_peripheral, Peri, PeripheralType};
 #[cfg(any(adc_f1, adc_f3v1, adc_v1, adc_l0, adc_f3v2))]
 use embassy_sync::waitqueue::AtomicWaker;
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
+use stm32_metapac::adc::vals::{Exten, Extsel};
 
 #[cfg(any(adc_u5, adc_wba))]
 #[path = "adc4.rs"]
@@ -42,7 +43,10 @@ pub use crate::pac::adc::vals;
 pub use crate::pac::adc::vals::Res as Resolution;
 pub use crate::pac::adc::vals::SampleTime;
 use crate::{
-    dma::{AnyChannel, ChannelState, DmaCtrlImpl, Priority, Request, Transfer, TransferEvent, TransferOptions},
+    dma::{
+        AnyChannel, ChannelState, DmaCtrlImpl, Priority, Request, Transfer, TransferEvent, TransferOptions,
+        TransferStreamError,
+    },
     peripherals,
 };
 
@@ -119,8 +123,8 @@ impl<'d, T: Instance> Adc<'d, T> {
 }
 
 impl<'d, 'a, T: Instance, const N: usize> Adc<'d, T, Buffer<'a, N>> {
-    pub fn read(&self) -> impl Stream<Item = &[u16]> {
-        self.buffer.transfer.completions().map(|ev| match ev {
+    pub fn read(&mut self) -> impl Stream<Item = Result<&[u16], TransferStreamError>> {
+        self.buffer.transfer.completions().map_ok(|ev| match ev {
             TransferEvent::Half => &self.buffer.buffer[..N / 2],
             TransferEvent::Complete => &self.buffer.buffer[N / 2..],
         })

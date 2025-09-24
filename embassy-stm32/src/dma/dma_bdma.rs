@@ -5,7 +5,7 @@ use core::task::{Context, Poll, Waker};
 
 use embassy_hal_internal::Peri;
 use embassy_sync::waitqueue::AtomicWaker;
-use futures_util::Stream;
+use futures_util::{Stream, TryStream};
 
 use super::ringbuffer::{DmaCtrl, Error, ReadableDmaRingBuffer, WritableDmaRingBuffer};
 use super::word::{Word, WordSize};
@@ -800,7 +800,7 @@ impl<'a> Transfer<'a> {
     //     .await
     // }
 
-    pub fn completions(&self) -> impl Stream<Item = TransferEvent> + '_ {
+    pub fn completions(&self) -> impl Stream<Item = Result<TransferEvent, TransferStreamError>> + '_ {
         TransferStream {
             transfer: self,
             prev_half_count: 0,
@@ -862,8 +862,13 @@ pub struct TransferStream<'a> {
     prev_complete_count: usize,
 }
 
+#[derive(Debug)]
+pub enum TransferStreamError {
+    MissedTransferEvents { half: usize, complete: usize },
+}
+
 impl<'a> Stream for TransferStream<'a> {
-    type Item = TransferEvent;
+    type Item = Result<TransferEvent, TransferStreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let state: &ChannelState = &STATE[self.transfer.channel.id as usize];
@@ -874,15 +879,15 @@ impl<'a> Stream for TransferStream<'a> {
             state.half_count.load(Ordering::Acquire),
             state.complete_count.load(Ordering::Acquire),
         );
-
+        debug!("half: {}, complete: {}", half_count, complete_count);
         let poll = match (
             half_count - self.prev_half_count,
             complete_count - self.prev_complete_count,
         ) {
             (0, 0) => Poll::Pending,
-            (1, 0) => Poll::Ready(Some(TransferEvent::Half)),
-            (0, 1) => Poll::Ready(Some(TransferEvent::Complete)),
-            _ => Poll::Ready(None), // Missed completion events,
+            (1, 0) => Poll::Ready(Some(Ok(TransferEvent::Half))),
+            (0, 1) => Poll::Ready(Some(Ok(TransferEvent::Complete))),
+            (half, complete) => Poll::Ready(Some(Err(TransferStreamError::MissedTransferEvents { half, complete }))),
         };
 
         self.prev_half_count = half_count;
