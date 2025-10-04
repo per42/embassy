@@ -158,7 +158,7 @@ pub enum Clock {
 // if the ADC is enabled and there is no pending request to disable the ADC (ADEN = 1 and
 // ADDIS = 0).
 
-impl<'d, T, B> Adc<'d, T, B>
+impl<'d, T, const CHANNEL_COUNT: usize, B> Adc<'d, T, CHANNEL_COUNT, B>
 where
     T: Instance,
     B: Buffered,
@@ -222,15 +222,16 @@ where
 }
 
 #[cfg(adc_g0)]
-impl<'d, T, B> Adc<'d, T, B>
+impl<'d, T, const CHANNEL_COUNT: usize, B> Adc<'d, T, CHANNEL_COUNT, B>
 where
     T: Instance,
     B: Buffered,
 {
-    pub fn configure_channels<'a>(
-        &self,
+    pub fn configure_channels<'a, const C: usize>(
+        self,
         sequence: impl ExactSizeIterator<Item = (&'a mut AnyAdcChannel<T>, SampleTime)>,
-    ) {
+    ) -> Adc<'d, T, C, B> {
+        assert!(sequence.len() == C); // TODO: Use array instead of iterator
         let mut sample_times = Vec::<SampleTime, SAMPLE_TIMES_CAPACITY>::new();
 
         T::regs().chselr().write(|chselr| {
@@ -250,6 +251,24 @@ where
                     }
                 }
             })
+        });
+
+        Adc {
+            adc: self.adc,
+            sample_time: self.sample_time,
+            buffer: self.buffer,
+        }
+    }
+
+    pub fn set_oversampling(&mut self, param: Option<(Ovsr, Ovss)>) {
+        T::regs().cfgr2().modify(|reg| {
+            if let Some((ratio, shift)) = param {
+                reg.set_ovsr(ratio);
+                reg.set_ovss(shift);
+                reg.set_ovse(true);
+            } else {
+                reg.set_ovse(false);
+            }
         });
     }
 }
@@ -579,6 +598,7 @@ impl<'d, T: Instance> Adc<'d, T> {
     /// .await;
     /// defmt::info!("measurements: {}", measurements);
     /// ```
+    #[cfg(not(adc_g0))]
     pub async fn read(
         &mut self,
         rx_dma: Peri<'_, impl RxDma<T>>,

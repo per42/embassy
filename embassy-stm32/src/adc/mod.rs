@@ -18,7 +18,9 @@
 mod _version;
 
 use core::{
+    array,
     future::{poll_fn, Future, IntoFuture},
+    iter::{repeat_n, repeat_with, Enumerate},
     marker::PhantomData,
     pin::Pin,
     task::Poll,
@@ -58,25 +60,35 @@ dma_trait!(RxDma4, adc4::Instance);
 dma_trait!(RxDma4, adc4::Instance);
 
 pub struct Buffer<'a, const N: usize> {
-    buffer: [u16; N],
+    buffer: &'a mut [u16; N],
     transfer: Transfer<'a>,
-    // transfer: Pin<Transfer<'a>>,
 }
-
+impl<'a, const N: usize> Buffer<'a, N> {
+    pub fn read(&mut self) -> impl Stream<Item = Result<&[u16], TransferStreamError>> {
+        self.transfer.completions().map_ok(|ev| match ev {
+            TransferEvent::Half => &self.buffer[..Buffer::<N>::FOO],
+            TransferEvent::Complete => &self.buffer[N / 2..],
+        })
+    }
+}
 pub struct NoBuffer;
 
 pub trait Buffered {
     const FOO: usize;
 }
 impl<'a, const N: usize> Buffered for Buffer<'a, N> {
-    const FOO: usize = N;
+    const FOO: usize = N / 2;
 }
 impl Buffered for NoBuffer {
     const FOO: usize = 0;
 }
 
 /// Analog to Digital driver.
-pub struct Adc<'d, T: Instance, B: Buffered = NoBuffer> {
+pub struct Adc<'d, T, const CHANNEL_COUNT: usize = 0, B = NoBuffer>
+where
+    T: Instance,
+    B: Buffered,
+{
     #[allow(unused)]
     adc: crate::Peri<'d, T>,
     #[cfg(not(any(adc_f3v3, adc_f3v2, adc_wba)))]
@@ -90,13 +102,13 @@ pub struct Adc<'d, T: Instance, B: Buffered = NoBuffer> {
 //     Foo(x, &mut x)
 // }
 
-impl<'d, T: Instance> Adc<'d, T> {
+impl<'d, T: Instance, const CHANNEL_COUNT: usize> Adc<'d, T, CHANNEL_COUNT> {
     pub fn into_buffered<'a, const N: usize>(
         self,
         dma: Peri<'a, impl RxDma<T>>,
         dma_prio: Priority,
-        mut buffer: [u16; N],
-    ) -> Adc<'d, T, Buffer<'a, N>> {
+        buffer: &'a mut [u16; N],
+    ) -> Adc<'d, T, CHANNEL_COUNT, Buffer<'a, N>> {
         let options = TransferOptions {
             circular: true,
             half_transfer_ir: true,
@@ -105,29 +117,58 @@ impl<'d, T: Instance> Adc<'d, T> {
         };
         let request = dma.request();
         let transfer: Transfer<'a> =
-            unsafe { Transfer::new_read_raw(dma, request, T::regs().dr().as_ptr() as *mut u16, &mut buffer, options) };
-        // let x: dyn Future<Output=()>=  transfer.into();
-        // let x = transfer.into_future();
-        // x.po
-        // transfer.await;
+            unsafe { Transfer::new_read_raw(dma, request, T::regs().dr().as_ptr() as *mut u16, buffer, options) };
         Adc {
             adc: self.adc,
             sample_time: self.sample_time,
             buffer: Buffer {
                 buffer,
-                transfer: transfer.into(),
-                // transfer: Pin::<_> { transfer },
+                transfer: transfer,
             },
         }
     }
 }
 
-impl<'d, 'a, T: Instance, const N: usize> Adc<'d, T, Buffer<'a, N>> {
-    pub fn read(&mut self) -> impl Stream<Item = Result<&[u16], TransferStreamError>> {
-        self.buffer.transfer.completions().map_ok(|ev| match ev {
-            TransferEvent::Half => &self.buffer.buffer[..N / 2],
-            TransferEvent::Complete => &self.buffer.buffer[N / 2..],
-        })
+impl<'d, 'a, T, const CHANNEL_COUNT: usize, const N: usize> Adc<'d, T, CHANNEL_COUNT, Buffer<'a, N>>
+where
+    T: Instance,
+{
+    // pub fn read(
+    //     &mut self,
+    // ) -> impl Stream<Item = Result<impl ExactSizeIterator<Item = impl ExactSizeIterator<Item = &u16>>, TransferStreamError>>
+    // {
+    //     self.buffer
+    //         .read()
+    //         .map_ok(|transferred| (0..CHANNEL_COUNT).map(|i| transferred.iter().skip(i).step_by(CHANNEL_COUNT)))
+    // }
+    pub fn read(
+        &mut self,
+    ) -> impl Stream<Item = Result<[impl ExactSizeIterator<Item = &u16> + Clone; CHANNEL_COUNT], TransferStreamError>>
+    {
+        self.buffer
+            .read()
+            .map_ok(|transferred| array::from_fn(|i| transferred.iter().skip(i).step_by(CHANNEL_COUNT)))
+    }
+    // fn bar() -> Result<impl ExactSizeIterator<Item = u16>, TransferStreamError> {
+    //     // let x: [usize; CHANNEL_COUNT] = (0..CHANNEL_COUNT).map(|i| i).try_into().unwrap();
+    //     let transferred = [1, 2, 3u16].as_ref();
+    //     // let y = (0..4).map(|i| transferred.iter().skip(i).step_by(CHANNEL_COUNT));
+    //     let z = (0..4).map(|i| i);
+    //     return Ok(z);
+
+    // }
+    fn bar(&self) -> Result<impl ExactSizeIterator<Item = u16> + Clone, TransferStreamError> {
+        // let x: [usize; CHANNEL_COUNT] = (0..CHANNEL_COUNT).map(|i| i).try_into().unwrap();
+        let transferred = [1, 2, 3u16].as_ref();
+        let y = (0..4).map(|i| transferred.iter().skip(i).step_by(CHANNEL_COUNT));
+        let z = (0..4).map(|i| i);
+        return Ok(z);
+    }
+    fn baaz(&self) {
+        if let Ok(x) = self.bar() {
+            let a = x.clone();
+            let b = x;
+        }
     }
 
     // pub async fn read<'b: 'd + 'a>(&self) -> &'b [u16] {
